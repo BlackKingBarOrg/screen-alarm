@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "ai.bkblab.screen-alarm",
+  "name": "Screen alarm",
+  "version": "0.1.0",
+  "author": "bkblab.ai",
+  "description": "Minutes left until the next screen-alarm posture reminder",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Posture timer",
+    "description": "Countdown to the next posture reminder",
+    "category": "Time",
+    "allowMultiple": false,
+    "defaultSection": "center"
+  }
+}

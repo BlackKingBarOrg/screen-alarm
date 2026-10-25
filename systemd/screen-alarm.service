@@ -1,0 +1,17 @@
+[Unit]
+Description=Posture reminder overlay (screen-alarm)
+# Needs the Wayland socket, so it starts with the graphical session.
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/Work/screen-alarm/bin/screen-alarm --sit 40 --stand 15 --monitor DP-1
+Restart=on-failure
+RestartSec=5
+# Covers SIGKILL too, so the bar never shows a frozen countdown.
+ExecStopPost=/bin/rm -f %t/screen-alarm.json
+Slice=session.slice
+
+[Install]
+WantedBy=graphical-session.target

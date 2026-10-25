@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+"""Posture reminder: alternates sitting and standing, covering the main
+monitor when the current stretch is up.
+
+Each posture has its own length (sitting 40 min, standing 15 min by default).
+The overlay asks which posture comes next, and the countdown only restarts
+once that choice is made, so time spent ignoring the overlay never counts.
+
+Control:
+  SIGUSR1                show the overlay now (preview / testing)
+  D-Bus action "start"   start sitting or standing now, e.g.
+      gdbus call --session --dest ai.bkblab.ScreenAlarm \\
+        --object-path /ai/bkblab/ScreenAlarm \\
+        --method org.gtk.Actions.Activate start "[<'stand'>]" "{}"
+
+State for the bar widget is kept in $XDG_RUNTIME_DIR/screen-alarm.json:
+  {"state": "counting", "posture": "sit", "deadline": <unix time>, "intervals": {...}}
+  {"state": "alert", "posture": <the posture that just ended>, "intervals": {...}}
+with intervals in seconds per posture. The file is removed on exit.
+"""
+
+import argparse
+import json
+import os
+import signal
+import sys
+import time
+import tomllib
+from ctypes import CDLL
+from datetime import datetime
+from pathlib import Path
+
+# gtk4-layer-shell must be loaded before libwayland-client, i.e. before gi.
+CDLL("libgtk4-layer-shell.so")
+
+import gi  # noqa: E402
+
+gi.require_version("Gdk", "4.0")
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gtk4LayerShell", "1.0")
+gi.require_version("GLibUnix", "2.0")
+from gi.repository import Gdk, Gio, GLib, GLibUnix, Gtk  # noqa: E402
+from gi.repository import Gtk4LayerShell as LayerShell  # noqa: E402
+
+APP_ID = "ai.bkblab.ScreenAlarm"
+POSTURES = ("sit", "stand")
+VERB = {"sit": "坐", "stand": "站"}
+# Keys and clicks are ignored this long after the overlay appears, so a
+# keystroke already on its way from typing cannot dismiss it unseen.
+GRACE_MS = 1500
+STATE_FILE = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "screen-alarm.json"
+THEME_COLORS = Path.home() / ".local/state/omarchy/current/theme/colors.toml"
+DEFAULT_COLORS = {
+    "background": "#1f1f28",
+    "foreground": "#dcd7ba",
+    "accent": "#7e9cd8",
+    "muted": "#727169",
+}
+
+
+def log(msg):
+    print(f"[screen-alarm] {msg}", flush=True)
+
+
+def publish(state):
+    """Replace the state file in one rename, so the bar never reads half a write."""
+    tmp = STATE_FILE.with_name(STATE_FILE.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(state))
+        os.replace(tmp, STATE_FILE)
+    except OSError as e:
+        log(f"cannot write {STATE_FILE}: {e}")
+
+
+def theme_colors():
+    """Current Omarchy theme colors, re-read each time so theme switches apply."""
+    colors = dict(DEFAULT_COLORS)
+    try:
+        theme = tomllib.loads(THEME_COLORS.read_text())
+    except (OSError, tomllib.TOMLDecodeError):
+        return colors
+    colors["background"] = theme.get("darker_background", theme.get("background", colors["background"]))
+    colors["foreground"] = theme.get("foreground", colors["foreground"])
+    colors["accent"] = theme.get("blue", theme.get("accent", colors["accent"]))
+    colors["muted"] = theme.get("dark_foreground", theme.get("muted", colors["muted"]))
+    return colors
+
+
+def css_for(c):
+    return f"""
+    window.screen-alarm {{
+        background-color: alpha({c["background"]}, 0.94);
+    }}
+    .screen-alarm .clock {{
+        color: {c["muted"]};
+        font-size: 28px;
+        font-feature-settings: "tnum";
+    }}
+    .screen-alarm .title {{
+        color: {c["foreground"]};
+        font-size: 72px;
+        font-weight: 800;
+    }}
+    .screen-alarm .body {{
+        color: alpha({c["foreground"]}, 0.8);
+        font-size: 26px;
+    }}
+    .screen-alarm .choices {{
+        margin-top: 24px;
+    }}
+    .screen-alarm button.choice {{
+        padding: 16px 40px;
+        border-radius: 12px;
+        font-size: 24px;
+        font-weight: 700;
+        color: {c["foreground"]};
+        background: transparent;
+        border: 2px solid alpha({c["foreground"]}, 0.35);
+        box-shadow: none;
+    }}
+    .screen-alarm button.choice.selected {{
+        color: {c["background"]};
+        background: {c["accent"]};
+        border-color: {c["accent"]};
+    }}
+    .screen-alarm button.choice:disabled {{
+        opacity: 0.4;
+    }}
+    .screen-alarm .hint {{
+        color: {c["muted"]};
+        font-size: 18px;
+    }}
+    """
+
+
+class ScreenAlarm(Gtk.Application):
+    def __init__(self, minutes, monitor_name):
+        super().__init__(application_id=APP_ID)
+        self.minutes = minutes  # {"sit": 40.0, "stand": 15.0}
+        self.monitor_name = monitor_name
+        self.posture = "sit"
+        self.timer_id = None
+        # Monotonic (µs), the same clock GLib's timeout runs on; None while
+        # the overlay is up.
+        self.deadline_us = None
+        self.system_bus = None
+        self.overlay = None
+        self.choice_buttons = {}
+        self.selected = None
+        self.armed = False
+        self.css = Gtk.CssProvider()
+
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+        # No window exists between reminders; keep the app alive anyway.
+        self.hold()
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), self.css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+        GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, self.on_show_now)
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, sig, self.on_quit)
+        start = Gio.SimpleAction.new("start", GLib.VariantType.new("s"))
+        start.connect("activate", self.on_start_action)
+        self.add_action(start)
+        self.watch_sleep()
+        self.start(self.posture)
+
+    def do_shutdown(self):
+        STATE_FILE.unlink(missing_ok=True)
+        Gtk.Application.do_shutdown(self)
+
+    def watch_sleep(self):
+        # The monotonic clock stops during suspend, so the countdown resumes
+        # where it left off; the wall-clock deadline the bar reads has to be
+        # pushed back by the same amount.
+        try:
+            self.system_bus = Gio.bus_get_sync(Gio.BusType.SYSTEM)
+        except GLib.Error as e:
+            log(f"no system bus, bar countdown will drift after suspend: {e.message}")
+            return
+        self.system_bus.signal_subscribe(
+            "org.freedesktop.login1",
+            "org.freedesktop.login1.Manager",
+            "PrepareForSleep",
+            "/org/freedesktop/login1",
+            None,
+            Gio.DBusSignalFlags.NONE,
+            self.on_prepare_for_sleep,
+        )
+
+    def on_prepare_for_sleep(self, _conn, _sender, _path, _iface, _signal, params):
+        (going_down,) = params.unpack()
+        if not going_down and self.deadline_us is not None:
+            self.publish_countdown()
+            log("resumed from suspend, deadline republished")
+
+    def do_activate(self):
+        # A second launch lands here via D-Bus; the running instance carries on.
+        pass
+
+    def intervals(self):
+        return {p: self.minutes[p] * 60 for p in POSTURES}
+
+    def start(self, posture):
+        self.cancel_countdown()
+        self.posture = posture
+        interval_ms = int(self.minutes[posture] * 60 * 1000)
+        self.timer_id = GLib.timeout_add(interval_ms, self.on_timeout)
+        self.deadline_us = GLib.get_monotonic_time() + interval_ms * 1000
+        self.publish_countdown()
+        log(f"{posture} started: next reminder in {self.minutes[posture]:g} min")
+
+    def cancel_countdown(self):
+        if self.timer_id is not None:
+            GLib.source_remove(self.timer_id)
+            self.timer_id = None
+        self.deadline_us = None
+
+    def publish_countdown(self):
+        remaining = (self.deadline_us - GLib.get_monotonic_time()) / 1e6
+        publish({
+            "state": "counting",
+            "posture": self.posture,
+            "deadline": time.time() + remaining,
+            "intervals": self.intervals(),
+        })
+
+    def on_timeout(self):
+        self.timer_id = None
+        self.deadline_us = None
+        self.show_overlay()
+        return GLib.SOURCE_REMOVE
+
+    def on_show_now(self):
+        self.cancel_countdown()
+        self.show_overlay()
+        return GLib.SOURCE_CONTINUE
+
+    def on_start_action(self, _action, param):
+        posture = param.get_string()
+        if posture not in POSTURES:
+            log(f"ignoring start action with unknown posture {posture!r}")
+            return
+        # Chosen on purpose from the bar, so the overlay's grace period does
+        # not apply.
+        self.close_overlay()
+        self.start(posture)
+
+    def on_quit(self):
+        self.quit()
+        return GLib.SOURCE_REMOVE
+
+    def target_monitor(self):
+        monitors = Gdk.Display.get_default().get_monitors()
+        available = [monitors.get_item(i) for i in range(monitors.get_n_items())]
+        for mon in available:
+            if mon.get_connector() == self.monitor_name:
+                return mon
+        if available:
+            log(f"monitor {self.monitor_name} not found, using {available[0].get_connector()}")
+            return available[0]
+        return None
+
+    def show_overlay(self):
+        if self.overlay is not None:
+            return
+        self.css.load_from_string(css_for(theme_colors()))
+        ended = self.posture
+        suggested = "stand" if ended == "sit" else "sit"
+
+        win = Gtk.Window(application=self)
+        win.add_css_class("screen-alarm")
+        LayerShell.init_for_window(win)
+        LayerShell.set_namespace(win, "screen-alarm")
+        LayerShell.set_layer(win, LayerShell.Layer.OVERLAY)
+        for edge in (LayerShell.Edge.TOP, LayerShell.Edge.BOTTOM, LayerShell.Edge.LEFT, LayerShell.Edge.RIGHT):
+            LayerShell.set_anchor(win, edge, True)
+        # -1: ignore the bar's reserved area and cover the whole monitor.
+        LayerShell.set_exclusive_zone(win, -1)
+        LayerShell.set_keyboard_mode(win, LayerShell.KeyboardMode.EXCLUSIVE)
+        monitor = self.target_monitor()
+        if monitor is not None:
+            LayerShell.set_monitor(win, monitor)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20)
+        box.set_halign(Gtk.Align.CENTER)
+        box.set_valign(Gtk.Align.CENTER)
+
+        clock = Gtk.Label(label=datetime.now().strftime("%H:%M"))
+        clock.add_css_class("clock")
+        if ended == "sit":
+            heading = "该站起来了"
+            text = f"已经坐了 {self.minutes['sit']:g} 分钟。\n站起来活动一下，顺便放松肩颈。"
+        else:
+            heading = "可以坐下了"
+            text = f"已经站了 {self.minutes['stand']:g} 分钟。\n坐下歇一会儿吧。"
+        title = Gtk.Label(label=heading)
+        title.add_css_class("title")
+        body = Gtk.Label(label=text, justify=Gtk.Justification.CENTER)
+        body.add_css_class("body")
+
+        # Fixed order (sit left, stand right) so the keys always mean the
+        # same thing; the suggestion is carried by the selection instead.
+        choices = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+        choices.add_css_class("choices")
+        choices.set_halign(Gtk.Align.CENTER)
+        self.choice_buttons = {}
+        for posture in POSTURES:
+            button = Gtk.Button(label=f"开始{VERB[posture]} · {self.minutes[posture]:g} 分钟")
+            button.add_css_class("choice")
+            # Unfocusable so Enter goes through on_key and its grace check.
+            button.set_focusable(False)
+            button.set_sensitive(False)
+            button.connect("clicked", lambda _b, p=posture: self.choose(p))
+            choices.append(button)
+            self.choice_buttons[posture] = button
+        self.select(suggested)
+
+        hint = Gtk.Label(label="← → 选择 · Enter 确认")
+        hint.add_css_class("hint")
+
+        for child in (clock, title, body, choices, hint):
+            box.append(child)
+        win.set_child(box)
+
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self.on_key)
+        win.add_controller(keys)
+        win.connect("notify::is-active", lambda w, _: log(f"keyboard focus: {w.is_active()}"))
+
+        self.overlay = win
+        self.armed = False
+        win.present()
+        GLib.timeout_add(GRACE_MS, self.arm, win)
+        publish({"state": "alert", "posture": ended, "intervals": self.intervals()})
+        log(f"overlay shown after {ended}")
+
+    def arm(self, win):
+        # The overlay this timer was set for may already be gone.
+        if self.overlay is win:
+            self.armed = True
+            for button in self.choice_buttons.values():
+                button.set_sensitive(True)
+        return GLib.SOURCE_REMOVE
+
+    def select(self, posture):
+        self.selected = posture
+        for p, button in self.choice_buttons.items():
+            if p == posture:
+                button.add_css_class("selected")
+            else:
+                button.remove_css_class("selected")
+
+    def on_key(self, _ctrl, keyval, _code, _state):
+        if not self.armed:
+            return True
+        if keyval in (Gdk.KEY_Left, Gdk.KEY_h):
+            self.select("sit")
+        elif keyval in (Gdk.KEY_Right, Gdk.KEY_l):
+            self.select("stand")
+        elif keyval in (Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab):
+            self.select("stand" if self.selected == "sit" else "sit")
+        elif keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            self.choose(self.selected)
+        # Swallow every key: the overlay holds exclusive keyboard focus.
+        return True
+
+    def choose(self, posture):
+        if self.overlay is None or not self.armed:
+            return
+        self.close_overlay()
+        self.start(posture)
+
+    def close_overlay(self):
+        if self.overlay is None:
+            return
+        self.overlay.destroy()
+        self.overlay = None
+        self.choice_buttons = {}
+        log("overlay closed")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Posture reminder overlay")
+    parser.add_argument("--sit", type=float, default=40, help="minutes of sitting before a reminder (default: 40)")
+    parser.add_argument("--stand", type=float, default=15, help="minutes of standing before a reminder (default: 15)")
+    parser.add_argument("--monitor", default="DP-1", help="connector name of the screen to cover (default: DP-1)")
+    args = parser.parse_args()
+    if args.sit <= 0 or args.stand <= 0:
+        parser.error("--sit and --stand must be positive")
+    app = ScreenAlarm({"sit": args.sit, "stand": args.stand}, args.monitor)
+    return app.run([sys.argv[0]])
+
+
+if __name__ == "__main__":
+    sys.exit(main())
